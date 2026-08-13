@@ -25,6 +25,25 @@ than shown in the clear, which is what turns the shared tree into one true
 anonymity set instead of one per institution. See §4 below for why that
 last point is load-bearing.*
 
+### 2.1 End-to-End Example
+
+![End-to-end walkthrough from mint through voluntary forfeiture](e2e_walkthrough_diagram.svg)
+
+The diagram follows one concrete asset through the complete lifecycle: Bank A
+mints 100 A-USD to Alice on Layer 1, Alice shields it into Layer 2, then spends
+the 100-value note into a 30-value note for Bob and a 70-value change note for
+herself. Bank A can recover both output values from the auditor ciphertexts,
+but its `audit_sk` does not reveal the owners and does not grant spending
+authority. The lifecycle ends with **voluntary forfeiture**: Bob authorizes an
+unshield of his 30-value note to Bank A's Layer-1 treasury, after which Bank A
+redeems/burns those 30 units.
+
+Forced forfeiture is deliberately shown as an unsupported branch. The current
+protocol gives Bank A neither Bob's `ask` nor the note opening, and specifies
+no `C_forfeit` circuit or alternative nullifier authorization path. Adding
+issuer-initiated seizure would therefore require a separate protocol design;
+it must not be inferred from the read-only audit capability.
+
 ## 3. Two-Layer Architecture
 
 - **Layer 1 — Issuance Ledger (Zether-style, per institution).** Each
