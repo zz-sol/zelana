@@ -37,6 +37,9 @@ syscalls. **This wiring is explicitly deferred** — the protocol below assumes
 a generic "verify Groth16 proof against public inputs" oracle, which may
 initially be implemented off-chain or as an unoptimized on-chain routine.
 
+The design can also be applied to Plonky-KZG prover with minimal changes.
+
+
 ---
 
 ## 1. Notation and Parameters
@@ -170,8 +173,7 @@ nf = Poseidon_NF(nk, rho, cm)
 `nf` is published and checked against a global nullifier set (append-only,
 reject if already present — this is the double-spend check).
 
-**Why `cm` is included, not just `rho`:** a simpler `nf = Poseidon_NF(nk,
-rho)` is sufficient for unlinkability, but Faerie-Gold-class attacks
+Note that a simpler `nf = Poseidon_NF(nk, rho)` is sufficient for unlinkability, but Faerie-Gold-class attacks
 historically arose from a note commitment admitting more than one valid
 opening — an attacker crafts a single `cm` for which two different `rho`
 values (or other fields) both "open" it, letting the same note be spent
@@ -288,20 +290,13 @@ nf_j = Poseidon_NF(nk_j, rho_j^in, cm_j^in)     (must equal public nf_j)
 ```
 nf_1 ≠ nf_2
 ```
-This is not optional. Without it, a prover could present the *same*
+This is to stop single proof double spending. 
+Without it, a prover could present the *same*
 underlying note as both input slots (reusing `ask, rho, cm` identically in
 both), producing `nf_1 = nf_2`, and have constraint (f) below count that
 one note's value twice while the on-chain nullifier-set check only ever
 sees one nullifier value inserted — a same-transaction double-count that
 inflates the transaction's effective input value using a single real note.
-This is the multi-input analogue of the classic "don't let a transaction
-list the same UTXO twice" bug, and it must be enforced *both* here, in the
-circuit (so a proof cannot even be constructed claiming to spend the same
-note twice within one transaction), *and* by the on-chain verifier, which
-must reject a transaction whose declared nullifier list contains a
-duplicate before consulting the historical nullifier set (the historical
-set alone cannot catch this, since neither copy exists in it yet at the
-start of the transaction).
 
 **(d) Output commitment correctness.** For each output `j`:
 ```
@@ -319,30 +314,12 @@ v = Σ_{k=0}^{L-1} b_k · 2^k,   b_k ∈ {0,1}
 field element; it is decomposed via two *witnessed and range-checked*
 non-negative parts, `delta_pos` and `delta_neg`, with:
 ```
-public_delta = delta_pos - delta_neg        (as a field equation)
+public_delta = delta_pos - delta_neg         (as a field equation)
 delta_pos · delta_neg = 0                    (at most one is nonzero)
 0 ≤ delta_pos < 2^L,   0 ≤ delta_neg < 2^L   (same bit-decomposition range check as (e))
 v_1^in + v_2^in + delta_pos = v_1^out + v_2^out + delta_neg
 ```
-**This range check on `delta_pos`/`delta_neg` is required, not cosmetic.**
-`public_delta` is a *public input*, supplied by whoever submits the
-transaction, and F_r arithmetic is modular. If `public_delta` (or its
-sign-decomposed parts) were left unconstrained in bit-length, a prover
-could choose a `public_delta` that is enormous — large enough to wrap
-around the field modulus — making the field equation in (f) hold for
-values of `v_j^in`/`v_j^out` that satisfy their own small range checks
-individually, while the *effective* real-world delta implied by wraparound
-is something else entirely. This is a standard instance of the
-"under-constrained circuit via missing range check" bug class documented
-across production ZK systems (Circom `LessThan`-without-bit-length-pinning
-incidents, missing leaf range checks in Merkle-tree implementations, and
-others catalogued in community ZK bug trackers); the general lesson is
-that *every* field element that participates in an arithmetic equality
-meant to represent bounded real-world quantities needs its own explicit
-range constraint, public input or not — it is not sufficient to range-check
-only the witnessed values and assume public inputs are "already fine"
-because the verifier can inspect them; the verifier only checks the field
-equation, not the real-world magnitude the prover intended.
+Here `L` is a constant that is sufficient to stop modular arithmetic in `Fr` to wraparound.
 
 **(g) Asset consistency.** All input and output notes (real and dummy —
 see §3.3) share the same `asset_id` witness.
@@ -352,10 +329,7 @@ see §3.3) share the same `asset_id` witness.
 leaf = Poseidon_REG(asset_id, audit_pk.x, audit_pk.y, issuance_pk, value_base.x, value_base.y)
 MerkleVerify(registry_root, leaf, reg_path) = 1
 ```
-(`value_base` is taken directly from this registry leaf — it is *not*
-independently recomputed via an in-circuit hash-to-curve, which would add
-cost for no additional guarantee, since the registry entry is already the
-canonical source of truth for `value_base`.)
+(`value_base` is taken directly from this registry leaf; we don't need to recompute it via an in-circuit hash-to-curve.)
 
 **(i) Auditor ciphertext correctness.** For each output `j`:
 ```
@@ -387,8 +361,7 @@ registered pair — a malicious sender cannot substitute an arbitrary
 `audit_pk` they control, because that pair would not be present in
 `Registry` and (h) would fail.
 
-### 4.5 Transaction Binding (correction to the earlier "no binding
-machinery needed" simplification)
+### 4.5 Transaction Binding 
 
 The high-level design document argued that folding value conservation
 into one whole-transaction Groth16 proof removes the need for Sapling/
@@ -464,11 +437,10 @@ assumption — not re-derived from the ciphertext on each use), and an amount
   homomorphic arithmetic itself).
 - The receiving account's ciphertext is correspondingly credited by `v`.
 
-### 5.3 Concurrency: Why L1 Accounts Need Epochs or an Equivalent
+### 5.3 Concurrency
 
 An account-ciphertext model like §5.1–5.2 has an inherent liveness problem,
-well documented in Zether's own literature (not a bug specific to this
-adaptation, but one this system inherits and must not ignore): a transfer
+well documented in Zether's own literature: a transfer
 proof is constructed against a *specific* observed `CT_old`. If any other
 transaction touching the same account is confirmed first — even an
 unrelated, honest one, such as an incoming credit from a different
@@ -478,12 +450,10 @@ rebuilt. An adversary who can reliably front-run a target account's pending
 transaction (e.g. a relayer with mempool visibility) can use this to
 repeatedly grief a specific account's transactions without needing to
 break any cryptographic assumption — this is a liveness/availability
-attack, not a soundness break, but it is real and specifically documented
-in the original Zether paper and its follow-ups as a problem requiring an
-explicit mitigation (Zether's own fix batches transactions into fixed
+attack, not a soundness break. Zether's own fix batches transactions into fixed
 **epochs**, with all transactions in an epoch proven against the same
 epoch-opening balance and applied atomically at epoch boundaries, rather
-than each transaction racing against the latest live ciphertext).
+than each transaction racing against the latest live ciphertext.
 
 This system's Layer 1 must adopt an equivalent mechanism — either Zether's
 epoch batching directly, or a per-account sequence-number/lock scheme
@@ -544,7 +514,7 @@ public input.
 
 ---
 
-## 7. On-Chain State and Verification Flow (protocol-level, syscall wiring deferred)
+## 7. On-Chain State and Verification Flow
 
 Global state:
 - `anchor` history (recent Merkle roots of the L2 pool tree, to allow proofs
@@ -634,7 +604,7 @@ beyond a semantically-secure ciphertext, per §9.2's DDH assumption. This is
 an unforgeable property (soundness-backed), not a cooperative/trust-based
 one.
 
-### 9.4 Discrete-Log-Bounded Decryption
+### 9.4 Decryption
 
 Exponential ElGamal requires solving a discrete log in `[0, 2^L)` to recover
 a plaintext value. This bounds `L` to a practically invertible range
@@ -645,10 +615,7 @@ auditing can maintain incremental baby-step-giant-step tables or simply
 track running balances as new notes arrive, avoiding a cold search per
 note.
 
-### 9.5 Externally Verifiable Supply — the Most Important Open Question
-
-This is the most significant finding of this review, and it is a genuine
-tension in the design, not a bug with a clean fix.
+### 9.5 Externally Verifiable Supply
 
 Zcash's own multi-asset shielded design (Orchard ZSA, ZIP 226/227)
 deliberately keeps each asset's **issuance and burn events public**, even
@@ -807,55 +774,3 @@ Incident response for a compromised `audit_sk_i` (which deanonymizes that
 institution's own historical flows to whoever obtained the key, but not
 other institutions') — rotation procedure and its interaction with already-
 issued ciphertexts is not specified here.
-
----
-
-## 12. Summary of What Is and Isn't Novel Here
-
-- **Novel / fully specified in this document:** the asset-hiding shared
-  Layer-2 pool (§3–§4), the per-asset unforgeable audit-ciphertext mechanism
-  (§4.4, §9.3), and the shield/unshield bridge tying a per-institution L1
-  ledger to that shared pool (§6).
-- **Adapted, not re-derived:** the Layer-1 confidential-account mechanics
-  (§5), which are Zether with a different curve/proof backend and an
-  explicit institutional audit ciphertext; correctness relies on citing
-  Zether's own published security analysis for the parts unchanged in
-  substance.
-- **Deferred:** everything in §11.
-
-### 12.1 Changelog: Soundness Review Pass
-
-This revision incorporates findings from a dedicated soundness/efficiency
-review conducted against the initial draft. Material changes:
-
-1. Bound `asset_id_i` to `issuance_pk_i` and required registration to prove
-   control of `issuance_sk_i` (§2.1, §2.2) — closes an asset-identifier
-   squatting/front-running gap.
-2. Required `value_base_i` to be computed canonically rather than
-   registrant-supplied, and flagged the degenerate-generator failure mode
-   it otherwise opens (§2.1, §4.3(h)/(i) note).
-3. Folded `cm` into the nullifier derivation as defense-in-depth against
-   Faerie-Gold/second-preimage-class attacks, and required an untruncated
-   commitment hash (§3.2).
-4. Removed the dummy-note asset-id exemption as an unnecessary special case
-   (§3.3, §4.3(g)).
-5. Added an explicit same-transaction nullifier-distinctness constraint,
-   closing a same-note double-count path in the value-conservation equation
-   (§4.3(c')).
-6. Added an explicit range constraint on `public_delta`'s signed
-   decomposition, closing a field-wraparound / under-constrained-circuit
-   gap in value conservation (§4.3(f)).
-7. Added a required transaction-binding signature, correcting an earlier
-   over-simplification that assumed removing value-commitment machinery
-   also removed the need for any binding/anti-malleability mechanism
-   (§4.5).
-8. Flagged Layer 1's inherent account-ciphertext concurrency/front-running
-   liveness issue and required an epoch or nonce-equivalent mechanism,
-   consistent with Zether's own documented mitigation (§5.3).
-9. Added §9.5, identifying full asset-hiding's removal of any externally
-   verifiable (non-issuer) supply invariant as the most significant open
-   design question, and proposed a candidate per-institution "solvency
-   proof" mechanism as a possible middle path.
-
-None of these were fatal to the overall architecture; all are
-incorporated as amendments above rather than requiring a redesign.
