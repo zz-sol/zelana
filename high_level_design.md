@@ -2,47 +2,40 @@
 
 ## 1. Goal
 
-Enable many institutions to issue confidential assets that share **one large
-anonymity pool**, while each institution retains the ability to **audit only
+Features supported:
+
+- Enable many institutions to issue confidential assets that share **one large
+anonymity pool**
+- each institution retains the ability to **audit only
 its own issued asset**, wherever that asset moves inside the shared pool —
 without needing to trust the pool operator, and without being able to see any
 other institution's traffic.
 
-Non-goals (v1): cross-asset atomic swaps inside the shielded pool, public
-issuance-supply transparency inside the pool (that stays at Layer 1), and
-recursive proof composition.
+Features not yet supported: 
+- cross-asset atomic swaps inside the shielded pool
+- public issuance-supply transparency inside the pool (that stays at Layer 1)
 
 ## 2. Architecture Diagram
-
-![Two-Layer Confidential Transfer Architecture](architecture_diagram.svg)
-
-*Blue = Layer 1 (Zether-shaped: accounts, `y = sk·G`, homomorphic ElGamal
-balances, an institutional "auditor" ciphertext). Green = Layer 2
-(Zcash-shaped: notes, commitments `cm`, nullifiers `nf`, one Merkle tree,
-one proof per transaction rather than per action). Purple = the new
-component — asset identity is proven via hidden registry membership rather
-than shown in the clear, which is what turns the shared tree into one true
-anonymity set instead of one per institution. See §4 below for why that
-last point is load-bearing.*
 
 ### 2.1 End-to-End Example
 
 ![End-to-end walkthrough from mint through voluntary forfeiture](e2e_walkthrough_diagram.svg)
 
-The diagram follows one concrete asset through the complete lifecycle: Bank A
-mints 100 A-USD to Alice on Layer 1, Alice shields it into Layer 2, then spends
-the 100-value note into a 30-value note for Bob and a 70-value change note for
-herself. Bank A can recover both output values from the auditor ciphertexts,
+The diagram follows one concrete asset through the complete lifecycle: 
+
+- Bank A mints 100 A-USD to Alice on Layer 1 
+- Alice shields it into Layer 2, then spends the 100-value note into a 30-value note for Bob and a 70-value change note for herself.
+- Bank A can recover both output values from the auditor ciphertexts,
 but its `audit_sk` does not reveal the owners and does not grant spending
-authority. The lifecycle ends with **voluntary forfeiture**: Bob authorizes an
+authority. 
+- The lifecycle ends with **voluntary forfeiture**: Bob authorizes an
 unshield of his 30-value note to Bank A's Layer-1 treasury, after which Bank A
 redeems/burns those 30 units.
 
-Forced forfeiture is deliberately shown as an unsupported branch. The current
+Forced forfeiture is deliberately not support. Bank A only has read-only ability. 
+The current
 protocol gives Bank A neither Bob's `ask` nor the note opening, and specifies
-no `C_forfeit` circuit or alternative nullifier authorization path. Adding
-issuer-initiated seizure would therefore require a separate protocol design;
-it must not be inferred from the read-only audit capability.
+no `C_forfeit` circuit or alternative nullifier authorization path. 
 
 ## 3. Two-Layer Architecture
 
@@ -66,21 +59,28 @@ it must not be inferred from the read-only audit capability.
   account. Both are proven in the same Groth16/Baby Jubjub/Poseidon toolkit
   as Layer 2, so the whole system uses one proving stack.
 
-## 4. Why Hiding the Asset ID Is the Crux of the Whole Design
+## 4. Hiding the Asset ID
+
+For simplicity let's assume each bank has a different ID for a same asset. I.e.,
+USDC with BoA will have a different asset ID from USDC with Chase.
 
 A shared tree by itself is not sufficient for a shared anonymity set. If a
 transaction publicly states "this note belongs to institution A's asset,"
 an observer can trivially filter the tree back down to institution A's own
 transfer history — recreating the small-pool problem the shared tree was
-supposed to solve. The fix: every transfer proves membership of
-`(asset_id, audit_pk, issuance_pk, value_base)` in a public registry Merkle
+supposed to solve. 
+
+The fix: _Zcash Orchard's multi-asset (ZSA) design_.
+
+Every transfer proves membership of `(asset_id, audit_pk, issuance_pk, value_base)` in a public registry Merkle
 tree **without revealing which registry entry matched**. The only public
 facts about a transfer are: it moved *some* validly registered asset,
 conserved value, and correctly encrypted its values under *some* registered
 audit key. This is the same mechanism behind Zcash Orchard's multi-asset
 (ZSA) design, adapted here for a multi-institution setting.
 
-## 5. Auditability Without Breaking Anonymity for Others
+## 5. Auditability
+Audit visibility is asset-scoped and cryptographically enforced via SNARKs.
 
 Every output note carries an **auditor ciphertext** — an exponential-ElGamal
 encryption of the note's value under the *issuing institution's* registered
@@ -88,36 +88,13 @@ audit public key, using that asset's own value-base generator. The circuit
 constrains this ciphertext to be correctly formed relative to the same value
 committed in the note. Consequences:
 
-- Institution A can decrypt every note tagged (invisibly, to everyone else)
-  with A's own asset, anywhere in the shared tree, at any time — because it
-  holds `audit_sk_A`.
+- Institution A, with `audit_sk_A`, can decrypt every note tagged (invisibly, to everyone else) with A's own asset.
 - Institution A **cannot** decrypt institution B's notes: doing so requires
   `audit_sk_B`, which A does not have.
 - No one — including the pool operator — can forge a valid transaction whose
-  auditor ciphertext doesn't match reality, because it's a SNARK-enforced
-  constraint, not a promise.
+  auditor ciphertext doesn't match reality -- auditor ciphertext is proved inside SNARK.
 
-This is the "trapdoored Zcash per institution" property: audit visibility is
-asset-scoped and cryptographically enforced, not access-controlled by
-infrastructure.
-
-## 6. Why No Separate Value-Commitment / Binding-Signature Layer
-
-*(Note: §4.5 of the full protocol has since amended this — the value-balance
-argument below still holds, but a separate transaction-binding signature
-turned out to be required for an unrelated anti-malleability reason. See
-the soundness review, Finding 6.)*
-
-Classic Zcash (Sapling/Orchard) needs Pedersen value commitments and a
-binding signature because each spend/output is proven by an independent
-per-action circuit, later aggregated into one transaction outside the proof
-system. Here, one Groth16 proof covers an entire transaction (all inputs and
-outputs at once), so value conservation is simply an arithmetic constraint —
-`Σ v_in = Σ v_out + public_delta` — enforced directly by the SNARK. This
-removes an entire cryptographic subsystem without weakening soundness, and
-noticeably shrinks the constraint count.
-
-## 7. Comparison to Zcash's Own Solutions
+## 6. Comparisons
 
 Zcash has effectively already explored this design space twice — once for a
 single asset, once for multiple assets — and it's worth being explicit
@@ -189,62 +166,47 @@ Walking through the substantive rows:
 - **We pay for that with ZSA's safety net.** ZSA's public issuance map is
   precisely what lets the network detect an inflation bug from outside, as
   the real 2026 Orchard incident underscored. Hiding asset identity removes
-  the ability to compute a per-asset running total from public data at all
-  — the reconciliation capability that remains (§5, and full protocol §9.5)
-  is opt-in and issuer-only, not network-wide. This is the single largest
-  point of divergence from Zcash's own risk posture, and it is flagged as
-  an open question rather than a settled trade-off in `soundness_review.md`
-  (Finding 1), not resolved here.
-- **We add a layer Zcash doesn't have at all.** Neither classic Zcash nor
-  ZSA has anything resembling Layer 1 — Zcash has no concept of a
+  the ability to compute a per-asset running total from public data at all. 
+  This is the single largest point of divergence from Zcash's own risk posture.
+    - As a follow up, institutations can peroidically public proof-of-reserve 
+    to show per-asset running total is unchanged. 
+- **We add a zether layer.** Zcash has no concept of a
   per-issuer institutional ledger with its own native audit capability,
   because Zcash's issuance (block-reward emission) isn't something an
   external institution needs to audit the way a bank or stablecoin issuer
   would need to audit its own confidential mint. This is the piece adapted
   from Zether rather than Zcash.
-- **We simplified the proof structure, at the cost of a capability we
-  judged unnecessary here.** Collapsing spend+output into one
+- **Simplified the proof structure.** Collapsing spend+output into one
   whole-transaction proof removes the need for Pedersen value commitments
-  and a binding signature for balance purposes (§6) — but it also removes
+  and a binding signature for balance purposes — but it also removes
   Orchard's untrusted multi-party bundling capability, since one prover now
   needs every witness in the transaction. We reviewed this trade-off
-  explicitly (soundness review, Finding 9) and concluded it isn't a real
+  explicitly and concluded it isn't a real
   loss for the stated use cases (no cross-institution atomic swaps or joint
   multi-sig spends are in scope), but it would need to be revisited if that
   scope ever changes.
-- **We took on a strictly heavier trusted-setup dependency than current
-  Zcash.** Sapling used Groth16 (trusted setup) but Orchard deliberately
-  moved to Halo2 specifically to eliminate that dependency. We use Groth16
-  again, for a different reason (BN254's native acceleration on our target
-  chain), which means we are accepting a trust assumption Zcash's own
-  current design has already moved past. This is already flagged as an
-  operational dependency (§7, full protocol §9.6) but is worth naming
-  explicitly as a step backward relative to Orchard specifically, not just
-  an abstract cost.
+  - Question/disucssion: are we able to fall back to a two prover construction?
 
-In one sentence: **Zcash/ZSA hides amounts and keeps asset identity and
+In summary: **Zcash/ZSA hides amounts and keeps asset identity and
 issuance public; we hide amounts and asset identity both, which is what
 buys the cross-institution shared anonymity pool, but it comes at the
 direct cost of the externally-verifiable supply invariant that Zcash's own
-design — reinforced by a real incident — was built to preserve.** That
-trade-off is the central open decision this project is carrying forward.
+design was built to preserve.** 
 
 ## 8. Cryptographic Toolkit
 
 - **Embedded curve:** Baby Jubjub (Edwards curve over BN254's scalar field)
   — chosen because BN254 is Solana's natively accelerated pairing-friendly
   curve, so eventual on-chain Groth16 verification is cheap once syscalls
-  are wired in (deferred per current scope).
-- **Proof system:** Groth16 — small constant-size proof, 3-pairing
-  verification, matches BN254 acceleration. Trade-off: requires a per-circuit
-  trusted setup ceremony (flagged as an operational dependency, not solved
-  here).
+  are wired in.
+- **Proof system:** Groth16 — small constant-size proof (200 B), 3-pairing
+  verification, matches BN254 acceleration. Alternatively we can also use plonky-KZG
+  now that the tx size is 8096B. plonky-KZG proof is between 1 KB to 3 KB.
 - **Hash:** Poseidon — arithmetic-circuit-friendly, used for note
   commitments, nullifiers, and all Merkle trees (pool tree and registry
   tree).
 - **Range proofs:** plain bit-decomposition inside the same Groth16 circuit
-  — cheaper here than Bulletproofs, since a second proof system would only
-  add cost once a trusted setup is already required for everything else.
+  — cheaper here than Bulletproofs used in Zether.
 
 ## 9. Security Properties (summary — see full protocol for reductions)
 
@@ -257,8 +219,8 @@ trade-off is the central open decision this project is carrying forward.
 - **Per-asset audit is complete and unforgeable**, subject to the audit
   secret key remaining private.
 - **CRS integrity is a hard trust dependency** — a compromised Groth16
-  trusted setup breaks soundness (inflation), not anonymity. This needs an
-  explicit ceremony plan.
+  trusted setup breaks soundness (inflation), not anonymity. May consider plonky-KZG
+  if CRS becomes a concern
 
 ## 10. Deferred to Later Work
 
