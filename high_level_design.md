@@ -1,232 +1,360 @@
-# Two-Layer Confidential Transfer Protocol — High-Level Design
+# Per-Institution Shielded Pools — High-Level Design
 
-## 1. Goal
+Status: v2 redesign. Supersedes the previous two-layer (Zether + shared
+pool) design in full; requirements and locked decisions live in
+[goal.md](goal.md). This document describes the architecture; a
+constraint-level spec follows separately.
 
-Features supported:
+---
 
-- Enable many institutions to issue confidential assets that share **one large
-anonymity pool**
-- each institution retains the ability to **audit only
-its own issued asset**, wherever that asset moves inside the shared pool —
-without needing to trust the pool operator, and without being able to see any
-other institution's traffic.
+## 1. Design Summary
 
-Features not yet supported: 
-- cross-asset atomic swaps inside the shielded pool
-- public issuance-supply transparency inside the pool (that stays at Layer 1)
+A **matrix of Zcash-style shielded pools, one per (institution, asset)**,
+deployed as programs on unmodified Solana, all proven on a single stack
+(Groth16 / Baby Jubjub / Poseidon over BN254).
 
-## 2. Architecture Diagram
+- Every institution custodies every asset it handles in **its own pools**.
+  Resting funds of one institution (and its clients) never enter another
+  institution's pool — no commingling anywhere (R1).
+- Value moves between institutions via **cross-pool shielded transfers**:
+  a note is burned in pool `(A, X)` and minted in pool `(B, X)` under a ZK
+  conservation proof; the amount is never public (R6). Each such transfer
+  accrues a **bilateral claim** from A to B, net-settled periodically in
+  the public base asset (D1).
+- Amounts and balances are hidden everywhere inside the system (R3);
+  in-pool unlinkability is Zcash-style membership over the whole pool (R4);
+  zero-value dummy transactions are indistinguishable from real ones by
+  construction (R5).
+- The issuing institution can audit its own asset via circuit-enforced
+  auditor ciphertexts — read-only, no spend authority (R7).
+- Repo/DvP is built from Solana transaction atomicity plus an intent-hash
+  binding in each leg's proof — no shielded VM, no binding signatures (D3,
+  R8).
 
-### 2.1 End-to-End Example
+What this design deliberately does **not** have (vs. the previous design):
+no shared anonymity pool, no hidden asset IDs, no ZK registry-membership
+machinery, no Zether account layer, no curve25519/BN254 gap in the core.
 
-![End-to-end walkthrough from mint through voluntary forfeiture](e2e_walkthrough_diagram.svg)
+---
 
-The diagram follows one concrete asset through the complete lifecycle: 
+## 2. Architecture
 
-- Bank A mints 100 A-USD to Alice on Layer 1 
-- Alice shields it into Layer 2, then spends the 100-value note into a 30-value note for Bob and a 70-value change note for herself.
-- Bank A can recover both output values from the auditor ciphertexts,
-but its `audit_sk` does not reveal the owners and does not grant spending
-authority. 
-- The lifecycle ends with **voluntary forfeiture**: Bob authorizes an
-unshield of his 30-value note to Bank A's Layer-1 treasury, after which Bank A
-redeems/burns those 30 units.
+```mermaid
+flowchart LR
+    subgraph pub["Public Solana"]
+        USDC["USDC mint (transparent)"]
+        VA["Vault A (public balance)"]
+        VB["Vault B (public balance)"]
+        ACC["Claim accumulator (A,B)
+Pedersen commitment, per asset"]
+    end
 
-Forced forfeiture is deliberately not support. Bank A only has read-only ability. 
-The current
-protocol gives Bank A neither Bob's `ask` nor the note opening, and specifies
-no `C_forfeit` circuit or alternative nullifier authorization path. 
+    subgraph instA["Institution A"]
+        PA1["Pool (A, USDC)
+note tree + nullifiers"]
+        PA2["Pool (A, Bond)
+note tree + nullifiers"]
+    end
 
-## 3. Two-Layer Architecture
+    subgraph instB["Institution B"]
+        PB1["Pool (B, USDC)
+note tree + nullifiers"]
+        PB2["Pool (B, Bond)
+note tree + nullifiers"]
+    end
 
-- **Layer 1 — Issuance Ledger (Zether-style, per institution).** Each
-  institution operates its own confidential-account ledger (adapted Zether):
-  accounts hold ElGamal-encrypted balances; transfers are homomorphic
-  ciphertext updates with a proof of correctness. This is where an asset is
-  actually minted/redeemed, and where the institution's regulator-facing
-  audit trail lives natively (the institution runs this ledger).
+    USDC -- "shield (amount public)" --> VA
+    VA --- PA1
+    USDC -- "shield (amount public)" --> VB
+    VB --- PB1
 
-- **Layer 2 — Shared Shielded Pool (Zcash-style, asset-hidden).** A single,
-  shared note-commitment tree and nullifier set, used for all pool-internal
-  transfers, regardless of issuing institution. Notes are Pedersen/Poseidon
-  commitments to `(asset_id, value, owner, ...)`. **The asset identity is
-  never revealed** in a transfer's public transcript — it is proven, in
-  zero-knowledge, to be a validly registered asset, without saying which one.
+    PA1 <-- "cross-pool shielded transfer
+(amount hidden, B co-signs)" --> PB1
+    PA2 <-- "cross-pool shielded transfer" --> PB2
 
-- **The Bridge (Shield / Unshield).** A pair of circuits that move value
-  between the two layers: *shield* debits a Layer-1 account and mints a
-  Layer-2 note; *unshield* spends a Layer-2 note and credits a Layer-1
-  account. Both are proven in the same Groth16/Baby Jubjub/Poseidon toolkit
-  as Layer 2, so the whole system uses one proving stack.
+    PA1 -. "accrues hidden claim" .-> ACC
+    PB1 -. "accrues hidden claim" .-> ACC
+    ACC -- "periodic net settlement
+(public, netted)" --> VA
+    ACC --> VB
+```
 
-## 4. Hiding the Asset ID
+### 2.1 The pool unit
 
-For simplicity let's assume each bank has a different ID for a same asset. I.e.,
-USDC with BoA will have a different asset ID from USDC with Chase.
+A pool is identified by `(custodian institution, asset)`. It consists of:
 
-A shared tree by itself is not sufficient for a shared anonymity set. If a
-transaction publicly states "this note belongs to institution A's asset,"
-an observer can trivially filter the tree back down to institution A's own
-transfer history — recreating the small-pool problem the shared tree was
-supposed to solve. 
+- a **note commitment tree** (Poseidon Merkle tree): each leaf commits to
+  `(value, owner_pk, randomness)` — no asset field, because the pool itself
+  fixes the asset;
+- a **nullifier set** preventing double-spends without revealing which
+  note was spent;
+- the custodian's **audit public key** and (for wrapped public assets) a
+  **public vault** holding the base-asset backing.
 
-The fix: _Zcash Orchard's multi-asset (ZSA) design_.
+Clients of institution A hold notes in A's pools. In-pool transfers
+(Alice → Bob, both clients of A) are standard shielded actions: spend
+notes, emit nullifiers, create output notes, prove conservation and range
+in ZK. Fixed transaction arity (e.g. 2-in/2-out, padded with zero-value
+notes) keeps every transaction shape-identical.
 
-Every transfer proves membership of `(asset_id, audit_pk, issuance_pk, value_base)` in a public registry Merkle
-tree **without revealing which registry entry matched**. The only public
-facts about a transfer are: it moved *some* validly registered asset,
-conserved value, and correctly encrypted its values under *some* registered
-audit key. This is the same mechanism behind Zcash Orchard's multi-asset
-(ZSA) design, adapted here for a multi-institution setting.
+### 2.2 Entry and exit (shield / unshield)
 
-## 5. Auditability
-Audit visibility is asset-scoped and cryptographically enforced via SNARKs.
+For a wrapped public asset (e.g. USDC): a user deposits public USDC into
+pool `(A, USDC)`'s vault and receives a note; unshield is the reverse.
+**Boundary amounts against a transparent base asset are necessarily
+public** — identical leakage to the wrapped-mint variant discussed in
+[discussions.md](discussions.md), where the `USDC → USDC.bofa` wrap is
+equally visible. Everything after the boundary is hidden.
 
-Every output note carries an **auditor ciphertext** — an exponential-ElGamal
-encryption of the note's value under the *issuing institution's* registered
-audit public key, using that asset's own value-base generator. The circuit
-constrains this ciphertext to be correctly formed relative to the same value
-committed in the note. Consequences:
+For a natively confidential asset (e.g. a bond issued by institution A):
+issuance mints notes directly into pool `(A, Bond)` with no public
+amount at all; the outstanding supply is known only to the issuer (via
+its audit key). There is no vault and no public base.
 
-- Institution A, with `audit_sk_A`, can decrypt every note tagged (invisibly, to everyone else) with A's own asset.
-- Institution A **cannot** decrypt institution B's notes: doing so requires
-  `audit_sk_B`, which A does not have.
-- No one — including the pool operator — can forge a valid transaction whose
-  auditor ciphertext doesn't match reality -- auditor ciphertext is proved inside SNARK.
+### 2.3 Cross-pool shielded transfer
 
-## 6. Comparisons
+The single mechanism for inter-institution value movement. To move value
+from pool `(A, X)` to pool `(B, X)`:
 
-Zcash has effectively already explored this design space twice — once for a
-single asset, once for multiple assets — and it's worth being explicit
-about what each of those designs did, and exactly where and why this
-protocol departs from them.
+1. the sender spends notes in `(A, X)` (nullifiers against A's tree) and
+   creates output notes in `(B, X)`, in one proof spanning both trees;
+   conservation and range are proven in ZK; the amount is never public;
+2. the output notes carry auditor ciphertexts under **B's** audit key
+   (B now custodies them) and the transfer carries an amount ciphertext
+   under **A's** key as well, so both counterparties — and only they —
+   learn the amount (need-to-know, R6);
+3. **B co-signs the transaction.** This is B's acceptance of A's IOU and
+   its real-time exposure-limit control: B can decrypt the incoming
+   amount and refuse to sign past its bilateral credit limit with A;
+4. the on-chain **claim accumulator** for the ordered pair `(A→B, X)` — a
+   Pedersen commitment — is updated homomorphically, with the circuit
+   proving the update matches the hidden transferred value. Both
+   institutions track the plaintext net position off-chain (each decrypts
+   every transfer's amount); no one else can.
 
-### 7.1 Classic Zcash (Sprout / Sapling / Orchard) — single asset
+Assumption made here (flagged, not from discussions): cross-pool minting
+is gated by the receiving institution's signature. This makes the
+receiving institution a required online party for incoming transfers,
+which matches institutional practice (a bank must accept an incoming
+correspondent-banking credit) but should be confirmed.
 
-The core mechanism is the one this protocol borrows for Layer 2: notes
-committed into a Merkle tree, nullifiers revealed at spend time without
-identifying which leaf they correspond to, and a proof that a valid input
-note was consumed to produce valid output notes. Because Sapling and
-Orchard prove **each spend/output independently** (an "action"), rather
-than one proof per whole transaction, they need an extra mechanism to
-enforce that everything nets to zero across a transaction assembled from
-independently-produced actions: a homomorphic **Pedersen value commitment**
-per action, summed by whoever assembles the transaction, checked against
-zero via an aggregate **binding signature**. This also gives Orchard a
-genuine capability this protocol does not have: independent, mutually
-distrusting parties can each produce their own action proof without
-revealing secrets to one another, and an untrusted third party can bundle
-those actions into one transaction. Classic Zcash has exactly one asset
-(ZEC), so none of this involves an "asset type" dimension at all.
+### 2.4 Settlement (D1)
 
-### 7.2 Orchard ZSA (ZIP 226 / ZIP 227) — Zcash's own multi-asset extension
+Bilateral claims are backed by **bilateral credit lines with periodic net
+settlement**:
 
-This is the closest existing precedent to what we're building, and the one
-worth reading most carefully before treating this design as final. ZSA
-extends Orchard to custom assets by giving each asset its own **value-base
-generator** (so different assets' value commitments can't be confused or
-forged against each other), while making a deliberate choice on the
-transparency axis: **issuance and burn events for each asset are public**,
-maintained as an on-chain issuance map, even though transfers inside the
-pool remain shielded (amounts and counterparties hidden).
+- at each settlement, A and B co-sign the plaintext net position `n` for
+  the period (both know it; the on-chain program checks the co-signature
+  and optionally a ZK opening of the accumulator against `n`), transfer
+  `n` units of the public base asset between vaults, and reset the
+  accumulator;
+- for natively confidential assets there is no public base; settlement is
+  issuer-mediated: the issuer burns claim-backing notes in one pool and
+  mints in the other, confidentially.
 
-The stated rationale for that choice is that it gives *anyone* — not just
-the issuer — an independently checkable supply invariant: sum the public
-issuance/burn events for an asset, compare against expectations, and a
-discrepancy is visible network-wide without needing any special key. This
-rationale was borne out in practice: Orchard's own native pool (which
-already hides transfer amounts, the same general category of information
-this protocol hides more of) suffered a real inflation vulnerability
-serious enough to require an emergency network-wide halt, and the very
-fact that amounts were hidden made it hard for anyone to fully rule out
-prior exploitation even after the fix shipped.
+**Honest leakage statement (R2).** For wrapped public assets, vault
+balances are public at all times. What is hidden is the *divergence*
+between vault balances and true positions — i.e. the intra-period
+bilateral claims — plus all gross flows, counterparty amounts, and
+individual transactions. Each settlement reveals one net flow per
+counterparty pair per period. The settlement cadence is therefore the
+leakage-granularity knob: longer periods leak less but carry more
+bilateral credit exposure; it is a per-institution configuration, not a
+protocol constant. For natively confidential assets, TVL and supply are
+fully hidden from everyone but the issuer. This is the same guarantee the
+wrapped-mint scheme in the discussions actually provides, stated
+precisely.
 
-### 7.3 Where and why this protocol differs
+---
 
-| | Classic Zcash | Orchard ZSA | This protocol |
-|---|---|---|---|
-| Number of assets | One (ZEC) | Many, via asset base | Many, one per institution |
-| Asset identity in a transfer | N/A | Public (asset base visible) | **Hidden** (proved via ZK registry membership) |
-| Issuance/supply | N/A | **Public** issuance map | Private to the issuing institution (L1 ledger) |
-| Externally verifiable supply invariant | N/A | Yes, by anyone | **No** — only the issuer, via its own audit key |
-| Proof granularity | Per action, aggregated | Per action, aggregated | **One proof per whole transaction** |
-| Cross-party transaction assembly | Yes (untrusted bundling) | Yes (untrusted bundling) | **No** — one prover needs all witnesses in a transaction |
-| Curve / proof system | Jubjub / Groth16 (Sapling), Pallas-Vesta / Halo2, no trusted setup (Orchard) | Same as Orchard | Baby Jubjub / BN254, Groth16 (trusted setup required) |
-| Issuance/redemption layer | N/A | Transparent issuance protocol, same chain | **Separate Zether-style per-institution ledger (Layer 1)**, external to the shielded pool |
+## 3. Anonymity
 
-Walking through the substantive rows:
+- **Within a pool (R4):** deposits and withdrawals are unlinkable via
+  membership proofs over the full note set — the anonymity set is the
+  entire history of the pool, not a sender-chosen ring. Ring-based
+  designs (anonymous Zether / PGC) were rejected in the discussions for
+  weaker privacy and 10–27 KB transactions.
+- **Dummy traffic (R5):** zero-value notes are native to the Zcash-style
+  action structure; since all amounts are hidden and all transactions are
+  shape-identical, dummy in-pool churn and real transfers are
+  cryptographically indistinguishable. The institution (or a relayer) can
+  inflate its pool's apparent volume at will. Fee economics and cadence
+  are open (goal.md §6.4).
+- **Across pools (open — goal.md §6.1):** a cross-pool transfer touches
+  both pool programs, so the *pair* of institutions (not the amount, not
+  the parties within each pool) is publicly visible. Mitigations if
+  required: zero-value dummy cross-pool transfers on a schedule, and/or
+  batching through a router program. Whether pair-visibility is
+  acceptable leakage needs confirmation from the institutional side.
 
-- **We hide more than ZSA does.** ZSA hides amounts and counterparties but
-  keeps asset identity public. We additionally hide asset identity itself
-  (§4). This is not an incremental difference — it's the specific choice
-  that makes the anonymity set the union of *all* institutions' activity
-  rather than one pool per institution, which is this project's central
-  goal and ZSA's design was never trying to achieve (Zcash's own assets
-  don't need cross-issuer pooling).
-- **We pay for that with ZSA's safety net.** ZSA's public issuance map is
-  precisely what lets the network detect an inflation bug from outside, as
-  the real 2026 Orchard incident underscored. Hiding asset identity removes
-  the ability to compute a per-asset running total from public data at all. 
-  This is the single largest point of divergence from Zcash's own risk posture.
-    - As a follow up, institutations can peroidically public proof-of-reserve 
-    to show per-asset running total is unchanged. 
-- **We add a zether layer.** Zcash has no concept of a
-  per-issuer institutional ledger with its own native audit capability,
-  because Zcash's issuance (block-reward emission) isn't something an
-  external institution needs to audit the way a bank or stablecoin issuer
-  would need to audit its own confidential mint. This is the piece adapted
-  from Zether rather than Zcash.
-- **Simplified the proof structure.** Collapsing spend+output into one
-  whole-transaction proof removes the need for Pedersen value commitments
-  and a binding signature for balance purposes — but it also removes
-  Orchard's untrusted multi-party bundling capability, since one prover now
-  needs every witness in the transaction. We reviewed this trade-off
-  explicitly and concluded it isn't a real
-  loss for the stated use cases (no cross-institution atomic swaps or joint
-  multi-sig spends are in scope), but it would need to be revisited if that
-  scope ever changes.
-  - Question/disucssion: are we able to fall back to a two prover construction?
+---
 
-In summary: **Zcash/ZSA hides amounts and keeps asset identity and
-issuance public; we hide amounts and asset identity both, which is what
-buys the cross-institution shared anonymity pool, but it comes at the
-direct cost of the externally-verifiable supply invariant that Zcash's own
-design was built to preserve.** 
+## 4. Auditability (R7)
 
-## 8. Cryptographic Toolkit
+Every output note carries an **auditor ciphertext** — an exponential
+ElGamal encryption (over Baby Jubjub) of the note's value under the
+custodian institution's registered audit key — and the circuit constrains
+it to match the committed value. Consequently:
 
-- **Embedded curve:** Baby Jubjub (Edwards curve over BN254's scalar field)
-  — chosen because BN254 is Solana's natively accelerated pairing-friendly
-  curve, so eventual on-chain Groth16 verification is cheap once syscalls
-  are wired in.
-- **Proof system:** Groth16 — small constant-size proof (200 B), 3-pairing
-  verification, matches BN254 acceleration. Alternatively we can also use plonky-KZG
-  now that the tx size is 8096B. plonky-KZG proof is between 1 KB to 3 KB.
-- **Hash:** Poseidon — arithmetic-circuit-friendly, used for note
-  commitments, nullifiers, and all Merkle trees (pool tree and registry
-  tree).
-- **Range proofs:** plain bit-decomposition inside the same Groth16 circuit
-  — cheaper here than Bulletproofs used in Zether.
+- the custodian can decrypt the values flowing through its own pools,
+  wherever they move, with no trusted third party;
+- it cannot decrypt any other institution's pool traffic (different audit
+  keys), and its audit key confers no spend authority — audit is strictly
+  read-only; forced forfeiture is deliberately unsupported;
+- for cross-pool transfers, both counterparties get an amount ciphertext
+  (§2.3), which doubles as the data source for bilateral claim tracking;
+- the issuer of a natively confidential asset can additionally verify
+  no-inflation of its own supply, and may publish proof-of-reserve /
+  proof-of-supply attestations without revealing values (S4).
 
-## 9. Security Properties (summary — see full protocol for reductions)
+Because pools are per-institution and publicly attributable, the previous
+design's machinery for *hiding which asset is being audited* (ZK registry
+membership, per-asset value bases) is unnecessary and has been removed.
 
-- **No inflation:** conservation constraints inside a sound SNARK prevent
-  value creation at Layer 2; Layer 1 inflation resistance is inherited from
-  Zether's existing security proof.
-- **Anonymity set = union of all institutions' pool activity**, subject to
-  DDH-type hardness on Baby Jubjub and Poseidon's random-oracle-like
-  behavior.
-- **Per-asset audit is complete and unforgeable**, subject to the audit
-  secret key remaining private.
-- **CRS integrity is a hard trust dependency** — a compromised Groth16
-  trusted setup breaks soundness (inflation), not anonymity. May consider plonky-KZG
-  if CRS becomes a concern
+---
 
-## 10. Deferred to Later Work
+## 5. Programmability: Repo / DvP (D3, R8)
 
-- `alt_bn128` syscall wiring for on-chain proof verification.
-- Groth16 trusted setup ceremony design/governance.
-- Registry governance (adding/removing institutions, key rotation, freeze).
-- Fee/relayer model for shielded transactions.
-- Diversified/stealth addresses for repeat-payment unlinkability.
-- Cross-asset swaps inside the shielded pool.
+The pool core is transfer-only. Conditional settlement is composed at the
+Solana layer:
+
+- a DvP is two legs in **different pools**, each proven independently by
+  the party holding that leg's witnesses (secrets never shared);
+- one Solana transaction bundles both legs; native transaction atomicity
+  makes them all-or-nothing — no central securities depository, no
+  Orchard-style binding signatures, no circuit changes;
+- each leg's proof binds an **intent hash** — a public input committing
+  to both legs' conditions — so a leg extracted from the mempool cannot
+  be replayed standalone;
+- a stateless **coordinator program** (or off-chain coordinator)
+  assembles the transaction and can enforce expiry.
+
+A repo is two DvPs plus a term agreement:
+
+```mermaid
+sequenceDiagram
+    participant A as Institution A (cash taker)
+    participant C as Coordinator
+    participant B as Institution B (cash giver)
+
+    Note over A,B: Opening leg (t = 0), one atomic Solana tx
+    A->>C: proof: bond notes, pool (A,Bond) → (B,Bond), bound to intent H
+    B->>C: proof: cash notes, pool (B,USDC) → (A,USDC), bound to intent H
+    C->>C: submit tx {leg1, leg2} — atomic, amounts hidden
+    Note over A,B: Closing leg (t = T): mirror-image DvP at repo price
+    Note over A,B: Non-performance at T is a credit event handled by the
+    Note over A,B: term agreement (collateral retention), as in traditional repo
+```
+
+Third parties observe only that two shielded operations touched two pool
+pairs — no amounts, no instruments, no rate. The closing leg's execution
+is a credit/legal matter, exactly as in traditional bilateral repo; the
+protocol does not attempt to enforce future obligations in-circuit.
+
+---
+
+## 6. Cryptographic Toolkit
+
+Single proving stack, no curve gap (D2):
+
+- **Proof system:** Groth16 over **BN254** — 200 B proofs, 3-pairing
+  verification via Solana's `alt_bn128` syscalls. Plonk-KZG (1–3 KB
+  proofs) remains a drop-in alternative if the trusted-setup ceremony
+  becomes a blocker.
+- **Embedded curve:** **Baby Jubjub** for all in-circuit group operations
+  (auditor ElGamal, key derivation).
+- **Hash:** **Poseidon** for note commitments, nullifiers, and Merkle
+  trees.
+- **Value commitments:** Pedersen over Baby Jubjub (claim accumulators).
+- **Range proofs:** bit decomposition inside the same circuit.
+- **Circuits:** `C_transfer` (in-pool), `C_shield` / `C_unshield`
+  (vault boundary), `C_crosspool` (two-tree spend/output + accumulator
+  update), `C_issue` (confidential issuance). All share the toolkit; the
+  asset dimension, registry tree, and Zether-layer circuits from the
+  previous design are gone.
+- **Transaction size (R9):** dominated by one Groth16 proof (~200 B) +
+  nullifiers + note commitments + ciphertexts per action; fits current
+  Solana limits with room to spare. Worst case (`C_crosspool` with
+  co-signature) to be computed precisely in the spec.
+
+Token-2022 confidential-transfer interop is an **optional adapter**
+(cross-curve equality proof at the vault boundary, S1) and never touches
+pool circuits.
+
+---
+
+## 7. Comparison
+
+| | Zcash / Orchard | Orchard ZSA | Previous design (v1) | **This design (v2)** |
+|---|---|---|---|---|
+| Pool topology | one global pool | one global pool, multi-asset | one shared pool, hidden asset IDs | **one pool per (institution, asset)** |
+| Commingling of institutions' funds | yes | yes | yes (in-tree) | **none** |
+| Asset identity in a transfer | N/A | public | hidden (ZK registry) | public by construction (pool = asset), **nothing to hide** |
+| Amounts / balances | hidden | hidden | hidden | hidden |
+| TVL / supply | public | public issuance map | issuer-only | **hidden** (native assets fully; wrapped public assets up to netted settlements) |
+| Anonymity set | global | global | union of all institutions | per-pool, **inflatable with indistinguishable dummies** |
+| Inter-institution transfer | N/A | N/A | in-pool | **cross-pool + bilateral netting (D1)** |
+| Programmability (repo/DvP) | no | no | out of scope | **Solana atomicity + intent hash (D3)** |
+| Extra layers | — | — | Zether L1 per institution | **none** |
+| Curves | Pallas/Vesta (Halo2) | same | Baby Jubjub + curve25519 gap | **Baby Jubjub / BN254 only** |
+| Supply-integrity check | public | public, by anyone | issuer audit key | issuer audit key + optional proof-of-reserve (S4) |
+
+Why v1 → v2: the discussions established that institutions reject fund
+commingling in any shared structure — including v1's shared tree, whose
+entire hidden-asset-ID apparatus existed to make sharing safe. Removing
+the shared pool removes that apparatus, the Zether layer, and the curve
+gap, at the cost of per-pool (rather than global) anonymity sets — which
+dummy traffic compensates for, per the direction agreed in the
+discussions.
+
+Inflation-risk posture: v2 keeps ZSA's lesson in a weaker form. There is
+no public supply invariant for confidential assets (that is the point),
+but each pool's issuer can continuously verify its own supply, wrapped
+assets are checkable against public vault balances plus settled claims,
+and per-pool blast radius means a soundness bug inflates one
+institution's asset, not a global pool.
+
+---
+
+## 8. Security Properties (summary)
+
+- **No inflation:** in-circuit conservation for in-pool transfers;
+  cross-pool conservation ties minted value in B to burned value in A and
+  to the claim accumulator; vault solvency for wrapped assets =
+  vault balance + net claims ≥ outstanding notes, issuer-verifiable.
+- **Isolation (R1):** structural — distinct trees, distinct nullifier
+  sets, distinct programs per institution.
+- **Unlinkability (R4):** membership-proof anonymity over the full pool,
+  under DDH on Baby Jubjub and Poseidon's random-oracle-style behavior.
+- **Dummy indistinguishability (R5):** by construction — uniform
+  transaction shape, hidden amounts, zero-value notes valid in-circuit.
+- **Audit completeness/unforgeability (R7):** auditor ciphertext
+  correctness is circuit-enforced; secrecy reduces to the audit key.
+- **CRS integrity:** a compromised Groth16 setup breaks soundness
+  (inflation, per-pool blast radius), not anonymity; Plonk-KZG universal
+  setup is the fallback if ceremony governance stalls.
+
+---
+
+## 9. Open Questions & Deferred Work
+
+Open (from [goal.md](goal.md) §6):
+
+1. counterparty-pair visibility of cross-pool transfers — acceptable, or
+   require dummy cross-pool traffic / routing?
+2. formal leakage model of periodic net settlement over time;
+3. cross-pool authorization details (this doc assumes receiving-
+   institution co-signature — confirm, and specify the claim-accumulator
+   opening/dispute path);
+4. dummy-traffic economics (fees, cadence, relayers, RPC-level
+   indistinguishability).
+
+Deferred to the spec / later work:
+
+- constraint-level circuit specification and worst-case transaction-size
+  accounting;
+- Groth16 ceremony design vs. Plonk-KZG decision;
+- pool governance (institution onboarding, audit-key rotation, freeze);
+- fee/relayer model for shielded transactions;
+- diversified/stealth addresses for repeat-payment unlinkability;
+- optional Token-2022 CT boundary adapter (S1).
