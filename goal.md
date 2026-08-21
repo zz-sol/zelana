@@ -67,7 +67,7 @@ own commitment tree, own nullifier set, own wrapped mint. One institution's
 resting liquidity never sits in a shared on-chain structure with another's,
 and the institution controls its own pool.
 
-— Hidden TVL (optional?). 
+- Hidden TVL (optional?). 
 
 The total value
 resting in a pool must not be derivable from public data. This was
@@ -77,22 +77,22 @@ public base asset is visible at the boundary, but cross-pool transfers move
 value between institutions without touching the public asset, so once those
 start happening the per-institution resting TVL becomes unobservable.
 
-— Confidential and Unlinkability. Classical Zcash setup.
+- Confidential and Unlinkability. Classical Zcash setup.
 
-— Anonymity-set inflation. 
+- Anonymity-set inflation. 
 
 Each pool's real user
 base may be small, so the protocol must support injecting artificial volume
 (zero-value transactions) that is indistinguishable from real traffic. 
 
-— Private inter-institution transfers. 
+- Private inter-institution transfers. 
 
 Institutions transfer value
 to each other (repos, settlement) leaks nothing to third parties. This
 includes the amount, and ideally not the frequency of bilateral flows beyond what's
 unavoidable. Additionally, in the case the transfer choose to not leak either side's TVL, this can be achieved via cross-pool shielded transfers.
 
-— Auditability.
+- Auditability.
 
 The issuing institution can audit its
 own asset (recover amounts for its regulator-facing trail) wherever the
@@ -113,5 +113,5 @@ forced forfeiture (or do we want forced forfeiture and frozen?).
 3. Cross-pool authorization. What does the receiving pool check before
    minting against a bilateral claim — a signature, claim-ledger state,
    exposure limits on-chain or off?
-   
+
 4. Dummy-traffic economics: fees, cadence, who pays, relayer design.
