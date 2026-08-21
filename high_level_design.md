@@ -38,44 +38,26 @@ circuit-enforced auditor ciphertexts — read-only.
 
 ## 2. Architecture
 
+Walkthrough: Alice, a client of institution A, sends USDC to Bob, a
+client of institution B.
+
 ```mermaid
-flowchart LR
-    subgraph pub["Public Solana"]
-        USDC["USDC mint (transparent)"]
-        VA["Vault A (public balance)"]
-        VB["Vault B (public balance)"]
-        ACC["Claim accumulator (A,B)
-Pedersen commitment, per asset"]
-    end
+sequenceDiagram
+    actor Alice as Alice (client of A)
+    participant PA as Pool (A, USDC)<br/>+ Vault A
+    participant PB as Pool (B, USDC)<br/>+ Vault B
+    participant IB as Institution B
+    actor Bob as Bob (client of B)
 
-    subgraph instA["Institution A"]
-        PA1["Pool (A, USDC)
-note tree + nullifiers"]
-        PA2["Pool (A, Bond)
-note tree + nullifiers"]
-    end
-
-    subgraph instB["Institution B"]
-        PB1["Pool (B, USDC)
-note tree + nullifiers"]
-        PB2["Pool (B, Bond)
-note tree + nullifiers"]
-    end
-
-    USDC -- "shield (amount public)" --> VA
-    VA --- PA1
-    USDC -- "shield (amount public)" --> VB
-    VB --- PB1
-
-    PA1 <-- "cross-pool shielded transfer
-(amount hidden, B co-signs)" --> PB1
-    PA2 <-- "cross-pool shielded transfer" --> PB2
-
-    PA1 -. "accrues hidden claim" .-> ACC
-    PB1 -. "accrues hidden claim" .-> ACC
-    ACC -- "settlement (out of protocol scope,
-e.g. periodic netting)" --> VA
-    ACC --> VB
+    Alice->>PA: 1. shield: deposit x USDC into Vault A<br/>(amount public), receive a note
+    Note over Alice: 2. build cross-pool proof:<br/>spend note in pool A, output note for Bob in pool B,<br/>amount hidden, auditor ciphertexts under A's and B's keys
+    Alice->>IB: 3. request co-signature
+    IB->>IB: decrypt incoming amount,<br/>check credit limit with A
+    IB-->>Alice: co-sign
+    Alice->>PA: 4. submit tx (atomic)
+    PA->>PB: nullifier recorded in A's tree,<br/>note for Bob minted in B's tree,<br/>claim accumulator A→B updated (hidden)
+    Bob->>PB: 5. spend privately in pool B,<br/>or unshield to public USDC from Vault B
+    Note over PA,PB: 6. later, out of protocol scope:<br/>A and B net-settle their claims,<br/>Vault A → Vault B public transfer, accumulator resets
 ```
 
 ### 2.1 The pool unit
